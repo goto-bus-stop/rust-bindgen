@@ -624,6 +624,15 @@ impl Item {
         &self.annotations
     }
 
+    /// Whether this item should have dynamic bindings generated, rather than normal bindings.
+    pub fn is_dynamic(&self, ctx: &BindgenContext) -> bool {
+        debug_assert!(
+            ctx.in_codegen_phase(),
+            "You're not supposed to call this yet"
+        );
+        ctx.dyngen_items().contains(&self.id)
+    }
+
     /// Whether this item should be blacklisted.
     ///
     /// This may be due to either annotations or to other kind of configuration.

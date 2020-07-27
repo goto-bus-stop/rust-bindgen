@@ -11,7 +11,7 @@ use super::derive::{
     CanDerive, CanDeriveCopy, CanDeriveDebug, CanDeriveDefault, CanDeriveEq,
     CanDeriveHash, CanDeriveOrd, CanDerivePartialEq, CanDerivePartialOrd,
 };
-use super::function::Function;
+use super::function::{Function, FunctionKind};
 use super::int::IntKind;
 use super::item::{IsOpaque, Item, ItemAncestors, ItemSet};
 use super::item_kind::ItemKind;
@@ -386,6 +386,11 @@ pub struct BindgenContext {
     /// It's computed right after computing the whitelisted items.
     codegen_items: Option<ItemSet>,
 
+    /// The set of `ItemId`s that we will perform dynamic binding generation for.
+    ///
+    /// It's computed following the codegen/whitelisted items.
+    dyngen_items: Option<ItemSet>,
+
     /// Map from an item's id to the set of template parameter items that it
     /// uses. See `ir::named` for more details. Always `Some` during the codegen
     /// phase.
@@ -619,6 +624,7 @@ If you encounter an error missing from this list, please file an issue or a PR!"
             generated_bindgen_complex: Cell::new(false),
             whitelisted: None,
             codegen_items: None,
+            dyngen_items: None,
             used_template_parameters: None,
             need_bitfield_allocation: Default::default(),
             cannot_derive_debug: None,
@@ -1188,6 +1194,9 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         // resolving type refs, as those are the final mutations of the IR
         // graph, and their completion means that the IR graph is now frozen.
         self.compute_whitelisted_and_codegen_items();
+
+        // Compute the items for dynamic generation.
+        self.compute_dynamic_generation_items();
 
         // Make sure to do this after processing replacements, since that messes
         // with the parentage and module children, and we want to assert that it
@@ -2262,6 +2271,13 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         self.codegen_items.as_ref().unwrap()
     }
 
+    /// Get a reference to the set of dynamic bindings we should generate.
+    pub fn dyngen_items(&self) -> &ItemSet {
+        assert!(self.in_codegen_phase());
+        assert!(self.current_module == self.root_module);
+        self.dyngen_items.as_ref().unwrap()
+    }
+
     /// Compute the whitelisted items set and populate `self.whitelisted`.
     fn compute_whitelisted_and_codegen_items(&mut self) {
         assert!(self.in_codegen_phase());
@@ -2410,6 +2426,70 @@ If you encounter an error missing from this list, please file an issue or a PR!"
         for item in self.options().whitelisted_types.unmatched_items() {
             warn!("unused option: --whitelist-type {}", item);
         }
+    }
+
+    /// Compute the items for dynamic generation.
+    fn compute_dynamic_generation_items(&mut self) {
+        assert!(self.in_codegen_phase());
+        assert!(self.current_module == self.root_module);
+        let _t = self.timer("compute_dynamic_generation_items");
+
+        let dyngen_items = self
+            .items()
+            // Only consider items that are enabled for codegen.
+            .filter(|&(_, item)| item.is_enabled_for_codegen(self))
+            .filter(|&(_, item)| {
+                // If the user has not chosen to do dynamic loading, then we have nothing to
+                // do.
+                if !self.options().dynamic_loading {
+                    return false;
+                }
+
+                let name = item.path_for_whitelisting(self)[1..].join("::");
+
+                // If there is a whitelist and this function is not on it, don't add it.
+                if !self.options().whitelisted_functions.is_empty() &&
+                    !self.options().whitelisted_functions.matches(&name)
+                {
+                    return false;
+                }
+
+                // If there is a blacklist and this function is on it, don't add it.
+                if !self.options().blacklisted_functions.is_empty() &&
+                    self.options.blacklisted_functions.matches(&name)
+                {
+                    return false;
+                }
+
+                // We don't want to include the root module in the list of items to generate
+                // dynamic bindings for.
+                if item.id() == self.root_module {
+                    return false;
+                }
+
+                // We only want to generate bindings for the stuff that we have at the toplevel.
+                if item.parent_id() != self.root_module {
+                    return false;
+                }
+
+                // If we get to here:
+                // - The user wants to generate dynamic bindings.
+                // - The item being considered is at the toplevel (but is not the root itself).
+                // - The item is permitted by the {white,black}list.
+
+                // Finally, only generate dynamic bindings for functions (for now! this could
+                // change in the future to support variables).
+                match item.kind() {
+                    ItemKind::Function(ref f) => {
+                        f.kind() == FunctionKind::Function
+                    }
+                    _ => false,
+                }
+            })
+            .map(|(id, _)| id)
+            .collect::<ItemSet>();
+
+        self.dyngen_items = Some(dyngen_items);
     }
 
     /// Convenient method for getting the prefix to use for most traits in

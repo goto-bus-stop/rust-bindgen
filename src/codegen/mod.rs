@@ -182,6 +182,7 @@ impl From<DerivableTraits> for Vec<&'static str> {
     }
 }
 
+#[derive(Clone)]
 struct CodegenResult<'a> {
     items: Vec<proc_macro2::TokenStream>,
 
@@ -432,6 +433,15 @@ impl CodeGenerator for Item {
         _extra: &(),
     ) {
         if !self.is_enabled_for_codegen(ctx) {
+            return;
+        }
+
+        if self.is_dynamic(ctx) {
+            debug!(
+                "Item is to be dynamically generated; ignoring it for now. \
+                 self = {:?}",
+                self
+            );
             return;
         }
 
@@ -3913,6 +3923,122 @@ impl CodeGenerator for ObjCInterface {
     }
 }
 
+trait DynamicBindingGenerator {
+    /// Extra information from the caller.
+    type Extra;
+
+    fn dyngen<'a>(
+        &self,
+        ctx: &BindgenContext,
+        struct_result: &mut CodegenResult<'a>,
+        impl_result: &mut CodegenResult<'a>,
+        extra: &Self::Extra,
+    );
+}
+
+impl DynamicBindingGenerator for Item {
+    type Extra = ();
+
+    fn dyngen<'a>(
+        &self,
+        ctx: &BindgenContext,
+        struct_result: &mut CodegenResult<'a>,
+        impl_result: &mut CodegenResult<'a>,
+        _extra: &(),
+    ) {
+        assert!(self.is_dynamic(ctx));
+        if !self.is_enabled_for_codegen(ctx) {
+            return;
+        }
+
+        // If this item is blacklisted, or we've already seen it, nothing to do.
+        if self.is_blacklisted(ctx) ||
+            struct_result.seen(self.id()) ||
+            impl_result.seen(self.id())
+        {
+            debug!(
+                "<Item as DynamicBindingGenerator>::codegen: Ignoring hidden or seen: \
+                 self = {:?}",
+                self
+            );
+            return;
+        }
+
+        debug!(
+            "<Item as DynamicBindingGenerator>::dyngen: self = {:?}",
+            self
+        );
+
+        if !ctx.codegen_items().contains(&self.id()) {
+            warn!("Found non-whitelisted item in dynamic binding generation: {:?}", self);
+        }
+
+        struct_result.set_seen(self.id());
+        impl_result.set_seen(self.id());
+
+        match *self.kind() {
+            ItemKind::Function(ref fun) => {
+                assert!(fun.kind() == FunctionKind::Function);
+                fun.dyngen(ctx, struct_result, impl_result, self);
+            }
+            _ => panic!(
+                "Unexpected item type when doing dynamic bindings generation."
+            ),
+        }
+    }
+}
+
+impl DynamicBindingGenerator for Function {
+    type Extra = Item;
+
+    fn dyngen<'a>(
+        &self,
+        ctx: &BindgenContext,
+        struct_result: &mut CodegenResult<'a>,
+        impl_result: &mut CodegenResult<'a>,
+        item: &Item,
+    ) {
+        let signature_item = ctx.resolve_item(self.signature());
+        let signature = signature_item.kind().expect_type().canonical_type(ctx);
+        let signature = match *signature.kind() {
+            TypeKind::Function(ref sig) => sig,
+            _ => panic!("Signature kind is not a Function: {:?}", signature),
+        };
+
+        let canonical_name = item.canonical_name(ctx);
+        let abi = match signature.abi() {
+            Abi::ThisCall if !ctx.options().rust_features().thiscall_abi => {
+                warn!("Skipping function with thiscall ABI that isn't supported by the configured Rust target");
+                return;
+            }
+            Abi::Win64 if signature.is_variadic() => {
+                warn!("Skipping variadic function with Win64 ABI that isn't supported");
+                return;
+            }
+            Abi::Unknown(unknown_abi) => {
+                panic!(
+                    "Invalid or unknown abi {:?} for function {:?} ({:?})",
+                    unknown_abi, canonical_name, self
+                );
+            }
+            abi => abi,
+        };
+
+        let args = utils::fnsig_arguments(ctx, signature);
+        let ret = utils::fnsig_return_ty(ctx, signature);
+
+        let ident = ctx.rust_ident(&canonical_name);
+
+        struct_result.push(quote! {
+            #ident: libloading::Symbol<'a, unsafe extern #abi fn ( #( #args ),* ) #ret>,
+        });
+
+        impl_result.push(quote! {
+            #ident: lib.get(#canonical_name.as_bytes()).unwrap(),
+        });
+    }
+}
+
 pub(crate) fn codegen(
     context: BindgenContext,
 ) -> (Vec<proc_macro2::TokenStream>, BindgenOptions) {
@@ -3947,6 +4073,75 @@ pub(crate) fn codegen(
             &mut result,
             &(),
         );
+
+        // If the set of items to generate dynamic bindings for is nonempty...
+        if !context.dyngen_items().is_empty() {
+            let _t = context.timer("dyngen");
+            debug!("dyngen: {:?}", context.options());
+
+            // `struct_result` tracks the tokens that will appears inside the library struct, e.g.:
+            // ```
+            // struct Lib {
+            //    x: libloading::Symbol<'a, ...>, // <- tracks these!
+            // }
+            // ```
+            //
+            // `impl_result` tracks the tokens that will appear inside the library struct's
+            // implementation, e.g.:
+            //
+            // ```
+            // impl<'a> Lib<'a> {
+            //     pub fn new(lib: &libloading::Library) -> Lib {
+            //        unsafe {
+            //            x: lib.get(...), // <- tracks these!
+            //        }
+            //     }
+            // }
+            // ```
+            //
+            // We clone the CodeGenerator object used for normal code generation, but set its items
+            // to the empty vector. We do this so that we can keep track of which items we have
+            // seen, etc.
+            let mut struct_result = result.clone();
+            struct_result.items = vec![];
+            let mut impl_result = result.clone();
+            impl_result.items = vec![];
+
+            // Run dynamic binding generation for each of the required items.
+            for item in context.dyngen_items() {
+                context.resolve_item(*item).dyngen(
+                    context,
+                    &mut struct_result,
+                    &mut impl_result,
+                    &(),
+                );
+            }
+
+            let lib_ident = context.rust_ident(
+                context.options().dynamic_library_name.as_ref().unwrap(),
+            );
+
+            let struct_items = struct_result.items;
+            result.push(quote! {
+                extern crate libloading;
+                pub struct #lib_ident<'a> {
+                    #(#struct_items)*
+                }
+            });
+
+            let impl_items = impl_result.items;
+            result.push(quote! {
+                impl<'a> #lib_ident<'a> {
+                    pub fn new(lib: &libloading::Library) -> #lib_ident {
+                        unsafe {
+                            #lib_ident {
+                                #(#impl_items)*
+                            }
+                        }
+                    }
+                }
+            });
+        }
 
         result.items
     })
