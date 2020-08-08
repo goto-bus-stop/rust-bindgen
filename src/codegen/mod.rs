@@ -4030,7 +4030,7 @@ impl DynamicBindingGenerator for Function {
         let ident = ctx.rust_ident(&canonical_name);
 
         struct_result.push(quote! {
-            #ident: libloading::Symbol<'a, unsafe extern #abi fn ( #( #args ),* ) #ret>,
+            pub #ident: libloading::Symbol<'a, unsafe extern #abi fn ( #( #args ),* ) #ret>,
         });
 
         impl_result.push(quote! {
